@@ -23,6 +23,10 @@ static mos_calc_fn *mos_calcs[__MOS_TYPES] = {
 };
 #endif
 
+// Maximum stored RTCP samples per SSRC. Lifetime MOS averages and extrema
+// are tracked separately so old history may be discarded safely.
+#define SSRC_STATS_HISTORY_MAX 512
+
 static void __free_ssrc_entry_call(struct ssrc_entry_call *e);
 
 
@@ -60,6 +64,8 @@ static void __free_ssrc_entry_call(struct ssrc_entry_call *e) {
 	g_queue_clear_full(&e->sender_reports, (GDestroyNotify) free_sender_report);
 	g_queue_clear_full(&e->rr_time_reports, (GDestroyNotify) free_rr_time);
 	g_queue_clear_full(&e->stats_blocks, (GDestroyNotify) free_stats_block);
+	free_stats_block(e->lowest_mos);
+	free_stats_block(e->highest_mos);
 	if (e->sequencers)
 		g_hash_table_destroy(e->sequencers);
 	bufferpool_unref(e->stats);
@@ -422,6 +428,53 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 	mutex_unlock(&e->lock);
 	obj_put(e);
 }
+// Takes ownership of ssb; the SSRC history, extrema and running totals are
+// protected by the SSRC lock. This is kept separate from RR decoding so the
+// bounded queue can be regression-tested with synthetic long-call samples.
+void ssrc_stats_record(struct ssrc_entry_call *e, struct ssrc_stats_block *ssb) {
+	mutex_lock(&e->h.lock);
+
+	if (e->stats_blocks.length > 0) {
+		struct ssrc_stats_block *last = g_queue_peek_tail(&e->stats_blocks);
+		if (ssb->reported - last->reported < 1000000LL) {
+			free_stats_block(ssb);
+			goto out;
+		}
+	}
+
+	g_queue_push_tail(&e->stats_blocks, ssb);
+
+	// Min/max own their data; pruning old samples cannot invalidate them.
+	if (ssb->mos && (!e->lowest_mos || ssb->mos < e->lowest_mos->mos)) {
+		if (!e->lowest_mos)
+			e->lowest_mos = g_new(struct ssrc_stats_block, 1);
+		*e->lowest_mos = *ssb;
+	}
+	if (ssb->mos && (!e->highest_mos || ssb->mos > e->highest_mos->mos)) {
+		if (!e->highest_mos)
+			e->highest_mos = g_new(struct ssrc_stats_block, 1);
+		*e->highest_mos = *ssb;
+	}
+
+	// All valid MOS reports contribute to lifetime averages, even after
+	// their entries age out of the bounded progression history.
+	if (ssb->mos) {
+		e->mos_sample_count++;
+		e->average_mos.jitter += ssb->jitter;
+		e->average_mos.mos += ssb->mos;
+		e->average_mos.rtt += ssb->rtt;
+		e->average_mos.rtt_leg += ssb->rtt_leg;
+		e->average_mos.packetloss += ssb->packetloss;
+	}
+
+	while (e->stats_blocks.length > SSRC_STATS_HISTORY_MAX)
+		free_stats_block(g_queue_pop_head(&e->stats_blocks));
+
+out:
+	mutex_unlock(&e->h.lock);
+}
+
+
 void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssrc_receiver_report *rr,
 		int64_t tv)
 {
@@ -495,41 +548,9 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 		RTPE_SAMPLE_SFD(mos, ssb->mos, sfd);
 	}
 
-	// got a new stats block, add it to reporting ssrc
-	mutex_lock(&other_e->h.lock);
-
-	// discard stats block if last has been received less than a second ago
-	if (G_LIKELY(other_e->stats_blocks.length > 0)) {
-		struct ssrc_stats_block *last_ssb = g_queue_peek_tail(&other_e->stats_blocks);
-		if (G_UNLIKELY(tv - last_ssb->reported < 1000000LL)) {
-			free_stats_block(ssb);
-			goto out_ul_oe;
-		}
-	}
-
-	g_queue_push_tail(&other_e->stats_blocks, ssb);
-
-	if (ssb->mos && ((G_UNLIKELY(!other_e->lowest_mos) || ssb->mos < other_e->lowest_mos->mos)))
-		other_e->lowest_mos = ssb;
-	if (G_UNLIKELY(!other_e->highest_mos) || ssb->mos > other_e->highest_mos->mos)
-		other_e->highest_mos = ssb;
-
-	// running tally
-	if (!ssb->mos) { // when we do not have the RTT for both legs, we have no MOS
-		other_e->no_mos_count++;
-	} else {
-		other_e->average_mos.jitter += ssb->jitter;
-		other_e->average_mos.mos += ssb->mos;
-		other_e->average_mos.rtt += ssb->rtt;
-		other_e->average_mos.rtt_leg += ssb->rtt_leg;
-		other_e->average_mos.packetloss += ssb->packetloss;
-	}
-
-	goto out_ul_oe;
-
-out_ul_oe:
-	mutex_unlock(&other_e->h.lock);
+	ssrc_stats_record(other_e, ssb);
 	goto out_nl_put;
+
 out_nl_put:
 	obj_put(&other_e->h);
 	goto out_nl;

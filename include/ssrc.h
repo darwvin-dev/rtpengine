@@ -70,11 +70,11 @@ struct ssrc_entry_call {
 
 	GQueue sender_reports; // as received via RTCP
 	GQueue rr_time_reports; // as received via RTCP
-	GQueue stats_blocks; // calculated
+	GQueue stats_blocks; // bounded recent history for MOS progression
 	struct ssrc_stats_block *lowest_mos,
 				*highest_mos,
-				average_mos; // contains a running tally of all stats blocks
-	uint16_t no_mos_count; // how many time we where not able to compute MOS due to missing RTT
+				average_mos; // lifetime extrema and running tally, independent of history
+	uint64_t mos_sample_count; // lifetime count of accepted reports with a valid MOS
 	unsigned int last_rtt; // last calculated raw rtt without rtt from opposide side
 	unsigned int last_rtt_xr; // last rtt for both legs retrieved from RTCP-XR BT-7
 
@@ -190,6 +190,9 @@ void ssrc_hash_call_init(struct ssrc_hash *);
 INLINE struct ssrc_entry_call *call_get_first_ssrc(struct ssrc_hash *ht) {
 	return ht->nq.head ? ht->nq.head->data : NULL;
 }
+
+// Takes ownership of the statistics block; keeps bounded history and lifetime MOS totals.
+void ssrc_stats_record(struct ssrc_entry_call *, struct ssrc_stats_block *);
 
 void ssrc_sender_report(struct call_media *, const struct ssrc_sender_report *, int64_t);
 void ssrc_receiver_report(struct call_media *, stream_fd *, const struct ssrc_receiver_report *, int64_t);
