@@ -2222,12 +2222,12 @@ static void __dtls_logic(const sdp_ng_flags *flags,
 
 
 static void __ice_init(struct call_media *media) {
-	if (MEDIA_ISSET(media, PASSTHRU)) {
+	if (!MEDIA_ISSET(media, ICE) || MEDIA_ISSET(media, PASSTHRU)) {
+		/* for the ice part: not doing ICE anymore with this peer,
+		 * discard this agent, so that ice offered again later starts afresh */
 		ice_shutdown(&media->ice_agent);
 		return;
 	}
-	if (!MEDIA_ISSET(media, ICE)) /* don't init new ICE agent but leave it running if there is one */
-		return;
 
 	ice_agent_init(&media->ice_agent, media);
 }
@@ -3939,8 +3939,10 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 				flags->opmode == OP_OFFER ? media_extmap_strip_mask : media_extmap_strip, flags);
 
 		if (flags->opmode == OP_OFFER) {
-			ilog(LOG_DEBUG, "Setting media recording slots to %u", flags->media_rec_slot_offer);
-			sender_media->media_rec_slot = receiver_media->media_rec_slot = flags->media_rec_slot_answer;
+			ilog(LOG_DEBUG, "Setting media recording slots to %d/%d",
+					flags->media_rec_slot_offer, flags->media_rec_slot_answer);
+			sender_media->media_rec_slot = flags->media_rec_slot_offer;
+			receiver_media->media_rec_slot = flags->media_rec_slot_answer;
 		}
 
 		codecs_offer_answer(receiver_media, sender_media, sp, flags);
@@ -4470,6 +4472,7 @@ int monologue_publish(struct call_monologue *ml, sdp_streams_q *streams, sdp_ng_
 		media_update_type(media, sp);
 		media_update_protocol(media, sp);
 		media_update_media_id(media, sp);
+		media_update_label(media, flags, &sp->label);
 		media_loop_protect(sp, media);
 		media_update_flags(media, sp);
 		media_update_crypto(media, sp, flags);
@@ -5356,7 +5359,7 @@ void call_destroy(call_t *c) {
 
 				if (!se->stats_blocks.length || !se->lowest_mos || !se->highest_mos)
 					continue;
-				int mos_samples = (se->stats_blocks.length - se->no_mos_count);
+				int mos_samples = se->mos_samples;
 				if (mos_samples < 1) mos_samples = 1;
 
 				ilog(LOG_INFO, "--- SSRC %s%" PRIx32 "%s", FMT_M(se->h.ssrc));
@@ -5373,7 +5376,7 @@ void call_destroy(call_t *c) {
 					se->highest_mos->mos % 10,
 					((se->highest_mos->reported - c->created) / 1000000L) / 60,
 					((se->highest_mos->reported - c->created) / 1000000L) % 60,
-					(unsigned int) se->packets_lost);
+					ssrc_packets_lost(se));
 				ilog(LOG_INFO, "------ respective (avg/min/max) jitter %" PRIu64 "/%" PRIu64 "/%" PRIu64 " ms, "
 						"RTT-e2e %" PRIu64 ".%" PRIu64 "/%" PRIu64 ".%" PRIu64
 						"/%" PRIu64 ".%" PRIu64 " ms, "

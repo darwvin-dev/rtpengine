@@ -39,6 +39,7 @@ static struct ssrc_entry *create_ssrc_entry_call(void *uptr) {
 		ent->ssrc_map_out = ssl_random();
 	atomic64_set_na(&ent->last_sample, rtpe_now);
 	ent->stats = bufferpool_alloc0(shm_bufferpool, sizeof(*ent->stats));
+	ent->stats->lost_bits = -1; // kernel tracker, so it doesn't count its first 32 packets as lost
 	ent->lost_bits = -1;
 	return &ent->h;
 }
@@ -57,9 +58,9 @@ static void free_stats_block(struct ssrc_stats_block *ssb) {
 	g_free(ssb);
 }
 static void __free_ssrc_entry_call(struct ssrc_entry_call *e) {
-	g_queue_clear_full(&e->sender_reports, (GDestroyNotify) free_sender_report);
-	g_queue_clear_full(&e->rr_time_reports, (GDestroyNotify) free_rr_time);
-	g_queue_clear_full(&e->stats_blocks, (GDestroyNotify) free_stats_block);
+	t_queue_clear_full(&e->sender_reports, free_sender_report);
+	t_queue_clear_full(&e->rr_time_reports, free_rr_time);
+	t_queue_clear_full(&e->stats_blocks, free_stats_block);
 	if (e->sequencers)
 		g_hash_table_destroy(e->sequencers);
 	bufferpool_unref(e->stats);
@@ -422,6 +423,32 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 	mutex_unlock(&e->lock);
 	obj_put(e);
 }
+
+static void __cleanup_stats_blocks(struct ssrc_entry_call *s) {
+	while (s->stats_blocks.length > 50) { // arbitrary limit
+		if (!s->decimator)
+			s->decimator = s->stats_blocks.head->next;
+
+		while (s->decimator &&
+				(s->decimator->data == s->lowest_mos || s->decimator->data == s->highest_mos))
+			s->decimator = s->decimator->next;
+
+		if (s->decimator == s->stats_blocks.tail)
+			s->decimator = NULL;
+
+		if (!s->decimator)
+			continue;
+
+		__auto_type next = s->decimator->next ? s->decimator->next->next : NULL;
+		__auto_type block = s->decimator->data;
+
+		t_queue_delete_link(&s->stats_blocks, s->decimator);
+		s->decimator = next;
+
+		free_stats_block(block);
+	}
+}
+
 void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssrc_receiver_report *rr,
 		int64_t tv)
 {
@@ -500,14 +527,14 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 
 	// discard stats block if last has been received less than a second ago
 	if (G_LIKELY(other_e->stats_blocks.length > 0)) {
-		struct ssrc_stats_block *last_ssb = g_queue_peek_tail(&other_e->stats_blocks);
+		struct ssrc_stats_block *last_ssb = t_queue_peek_tail(&other_e->stats_blocks);
 		if (G_UNLIKELY(tv - last_ssb->reported < 1000000LL)) {
 			free_stats_block(ssb);
 			goto out_ul_oe;
 		}
 	}
 
-	g_queue_push_tail(&other_e->stats_blocks, ssb);
+	t_queue_push_tail(&other_e->stats_blocks, ssb);
 
 	if (ssb->mos && ((G_UNLIKELY(!other_e->lowest_mos) || ssb->mos < other_e->lowest_mos->mos)))
 		other_e->lowest_mos = ssb;
@@ -515,15 +542,16 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 		other_e->highest_mos = ssb;
 
 	// running tally
-	if (!ssb->mos) { // when we do not have the RTT for both legs, we have no MOS
-		other_e->no_mos_count++;
-	} else {
+	if (ssb->mos) { // when we do not have the RTT for both legs, we have no MOS
+		other_e->mos_samples++;
 		other_e->average_mos.jitter += ssb->jitter;
 		other_e->average_mos.mos += ssb->mos;
 		other_e->average_mos.rtt += ssb->rtt;
 		other_e->average_mos.rtt_leg += ssb->rtt_leg;
 		other_e->average_mos.packetloss += ssb->packetloss;
 	}
+
+	__cleanup_stats_blocks(other_e);
 
 	goto out_ul_oe;
 
@@ -699,6 +727,19 @@ out:
 }
 
 
+// sequence-gap based loss, counted in userspace and in the kernel for packets each one handled
+uint32_t ssrc_packets_lost(struct ssrc_entry_call *se) {
+	return se->packets_lost + atomic_get_na(&se->stats->total_lost);
+}
+
+// RFC 3550 interarrival jitter (scaled by 16, in RTP timestamp units). The kernel keeps
+// its own estimate if it measures RTP stats, which is the current one once it has taken
+// over forwarding this SSRC.
+uint32_t ssrc_jitter(struct ssrc_entry_call *se) {
+	uint32_t kernel_jitter = atomic_get_na(&se->stats->jitter);
+	return kernel_jitter ? kernel_jitter : se->jitter;
+}
+
 // call master lock held in R
 void ssrc_collect_metrics(struct call_media *media) {
 	for (GList *l = media->ssrc_hash_in.nq.head; l; l = l->next) {
@@ -706,20 +747,25 @@ void ssrc_collect_metrics(struct call_media *media) {
 		if (!s)
 			break; // end of list
 
+		// work on a copy, as the estimator itself must stay in RTP timestamp units
+		uint32_t jitter = ssrc_jitter(s);
 		// exclude zero values - technically possible but unlikely and probably just unset
-		if (!s->jitter)
+		if (!jitter)
 			continue;
 
-		if (s->tracker.most_len > 0 && s->tracker.most[0] != 255) {
-			const rtp_payload_type *rpt = get_rtp_payload_type(s->tracker.most[0],
-					&media->codecs);
-			if (rpt && rpt->clock_rate)
-				s->jitter = s->jitter * 1000 / rpt->clock_rate;
-		}
+		// The sampled metric is in ms. Without a known RTP clock rate,
+		// publishing raw clock ticks here would mislabel its units.
+		if (!s->tracker.most_len || s->tracker.most[0] == 255)
+			continue;
+		const rtp_payload_type *rpt = get_rtp_payload_type(s->tracker.most[0],
+				&media->codecs);
+		if (!rpt || !rpt->clock_rate)
+			continue;
+		jitter = jitter * 1000 / rpt->clock_rate;
 
 		if (media->streams.head) {
 			LOCK(&media->streams.head->lock);
-			RTPE_SAMPLE_SFD(jitter_measured, s->jitter, media->streams.head->selected_sfd);
+			RTPE_SAMPLE_SFD(jitter_measured, jitter, media->streams.head->selected_sfd);
 		}
 	}
 }
