@@ -9943,6 +9943,114 @@ rcv($sock_b, $port_a, rtpm(8, 1010, 4280, 0x1234, "\x00" x 160));
 
 
 
+# inject DTMF with passthrough: a second sink of the stream receives the packets as sent
+
+($sock_a, $sock_b, $sock_c) = new_call([qw(198.51.100.50 3070)], [qw(198.51.100.50 3072)],
+	[qw(198.51.100.50 3074)]);
+
+($port_a) = offer('inject passthrough, second sink',
+       { flags => [qw(inject-DTMF)] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.11
+s=tester
+t=0 0
+m=audio 3070 RTP/AVP 8 101
+c=IN IP4 198.51.100.50
+a=sendrecv
+a=rtpmap:101 telephone-event/8000
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.11
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8 101
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('inject passthrough, second sink',
+       { flags => [qw(inject-DTMF)] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.11
+s=tester
+t=0 0
+m=audio 3072 RTP/AVP 8 101
+c=IN IP4 198.51.100.50
+a=sendrecv
+a=rtpmap:101 telephone-event/8000
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.11
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8 101
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$resp = rtpe_req('subscribe request', 'second sink of A',
+       { 'from-tag' => ft(), 'to-tag' => 'second-sink' });
+($port_c) = $resp->{sdp} =~ /m=audio (\d+) RTP\/AVP 8 101/;
+ok($port_c, 'second sink of A has a media port');
+subscribe_answer('second sink of A', { 'to-tag' => 'second-sink' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.11
+s=tester
+t=0 0
+m=audio 3074 RTP/AVP 8 101
+c=IN IP4 198.51.100.50
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=sendrecv
+SDP
+
+snd($sock_a, $port_b, rtp(8, 1000, 3000, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1001, 3160, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1001, 3160, 0x1234, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 1001, 3160, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1002, 3320, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1002, 3320, 0x1234, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 1002, 3320, 0x1234, "\x00" x 160));
+
+$resp = rtpe_req('play DTMF', 'inject DTMF towards B beside a second sink',
+       { 'from-tag' => ft(), code => '0', volume => 10, duration => 100 });
+
+# B gets the event, the second sink gets the packets as A sent them
+snd($sock_a, $port_b, rtp(8, 1003, 3480, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(101 | 0x80, 1003, 3480, 0x1234, "\x00\x0a\x00\xa0"));
+rcv($sock_c, $port_c, rtpm(8, 1003, 3480, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1004, 3640, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(101, 1004, 3480, 0x1234, "\x00\x0a\x01\x40"));
+rcv($sock_c, $port_c, rtpm(8, 1004, 3640, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1005, 3800, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(101, 1005, 3480, 0x1234, "\x00\x0a\x01\xe0"));
+rcv($sock_c, $port_c, rtpm(8, 1005, 3800, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1006, 3960, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(101, 1006, 3480, 0x1234, "\x00\x0a\x02\x80"));
+rcv($sock_c, $port_c, rtpm(8, 1006, 3960, 0x1234, "\x00" x 160));
+snd($sock_a, $port_b, rtp(8, 1007, 4120, 0x1234, "\x00" x 160));
+# end event
+rcv($sock_b, $port_a, rtpm(101, 1007, 3480, 0x1234, "\x00\x8a\x03\x20"));
+rcv($sock_b, $port_a, rtpm(101, 1008, 3480, 0x1234, "\x00\x8a\x03\x20"));
+rcv($sock_b, $port_a, rtpm(101, 1009, 3480, 0x1234, "\x00\x8a\x03\x20"));
+rcv($sock_c, $port_c, rtpm(8, 1007, 4120, 0x1234, "\x00" x 160));
+
+# B continues after the event's three end packets, the second sink with A's own numbering
+snd($sock_a, $port_b, rtp(8, 1008, 4280, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1010, 4280, 0x1234, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 1008, 4280, 0x1234, "\x00" x 160));
+
+
+
+
 # inject DTMF to SRTP with passthrough
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.50 3056)], [qw(198.51.100.50 3058)]);
@@ -25724,6 +25832,146 @@ rcv($sock_b, -1, rtpm(8, $seq + 9, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 
+# media from B forwarded to A, header fields may be rewritten after a playback
+my $fwd_silence = qr/^\x80[\x08\x88].{10}\x00{160}$/s;
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 2140)], [qw(198.51.100.3 2142)]);
+
+($port_a) = offer('media playback, stop on ingress', { ICE => 'remove', replace => ['origin'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 2140 RTP/AVP 8
+c=IN IP4 198.51.100.1
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 203.0.113.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('media playback, stop on ingress', { replace => ['origin'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 2142 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 203.0.113.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+# long enough to still be playing when B's media arrives
+$resp = rtpe_req('play media', 'media playback, stop on ingress', { 'from-tag' => ft(), blob => $wav_file,
+	'repeat-times' => 100, flags => ['stop-on-ingress'] });
+is $resp->{duration}, 100, 'media duration';
+
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
+rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
+
+# first packet from B stops the playback, while itself still being blocked
+snd($sock_b, $port_a, rtp(8, 4000, 8000, 0x6543, "\x00" x 160));
+Time::HiRes::sleep(0.1);
+my @stop_on_ingress_drained;
+while (defined $sock_a->recv(my $packet, 65535, Socket::MSG_DONTWAIT())) {
+	push(@stop_on_ingress_drained, $packet);
+}
+ok(!(grep { $_ =~ $fwd_silence } @stop_on_ingress_drained), 'triggering packet not forwarded');
+rcv_no($sock_a);
+
+# then media from B is forwarded as usual
+snd($sock_b, $port_a, rtp(8, 4001, 8160, 0x6543, "\x00" x 160));
+rcv($sock_a, $port_b, $fwd_silence);
+snd($sock_b, $port_a, rtp(8, 4002, 8320, 0x6543, "\x00" x 160));
+rcv($sock_a, $port_b, $fwd_silence);
+
+# the controller's own `stop media` afterwards is harmless
+rtpe_req('stop media', 'media playback, stop on ingress', { 'from-tag' => ft() });
+snd($sock_b, $port_a, rtp(8, 4003, 8480, 0x6543, "\x00" x 160));
+rcv($sock_a, $port_b, $fwd_silence);
+
+
+
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 2150)], [qw(198.51.100.3 2152)]);
+
+($port_a) = offer('media playback, block egress without stop on ingress', { ICE => 'remove', replace => ['origin'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 2150 RTP/AVP 8
+c=IN IP4 198.51.100.1
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 203.0.113.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('media playback, block egress without stop on ingress', { replace => ['origin'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 2152 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 203.0.113.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$resp = rtpe_req('play media', 'media playback, block egress without stop on ingress', { 'from-tag' => ft(),
+	blob => $wav_file, 'repeat-times' => 100, flags => ['block egress'] });
+is $resp->{duration}, 100, 'media duration';
+
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
+
+# media from B stays blocked and the playback goes on
+snd($sock_b, $port_a, rtp(8, 4000, 8000, 0x6543, "\x00" x 160));
+rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
+snd($sock_b, $port_a, rtp(8, 4001, 8160, 0x6543, "\x00" x 160));
+rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
+rcv($sock_a, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
+rcv($sock_a, -1, rtpm(8, $seq + 5, $ts + 160 * 5, $ssrc, $pcma_1));
+
+rtpe_req('stop media', 'media playback, block egress without stop on ingress', { 'from-tag' => ft() });
+
+
+
+
 ($sock_a, $sock_b) = new_call([qw(198.51.100.9 2020)], [qw(198.51.100.9 2022)]);
 
 offer('media playback, side A, select by label', { ICE => 'remove', replace => ['origin'],
@@ -29722,6 +29970,250 @@ sleep(2);
 snd($sock_a, $port_b, $dup_pkt);
 rcv($sock_b, $port_a, $dup_match);
 
+
+
+# local-port and from-local-port: the controller picks our ports.
+# The ports are outside of the pool, so that no earlier test can hold them.
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 7196)], [qw(198.51.100.3 7198)]);
+
+offer('local ports', {
+		ICE => 'remove',
+		'local-port' => 20040,
+		'from-local-port' => [ 20050 ],
+	}, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 7196 RTP/AVP 8
+c=IN IP4 198.51.100.1
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 20040 RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:20041
+SDP
+
+answer('local ports', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 7198 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 20050 RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:20051
+SDP
+
+($port_a, $port_b) = (20040, 20050);
+
+snd($sock_a, $port_b,  rtp(8, 1000, 3000, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160));
+snd($sock_b, $port_a,  rtp(8, 2000, 4000, 0x6543, "\x11" x 160));
+rcv($sock_a, $port_b, rtpm(8, 2000, 4000, 0x6543, "\x11" x 160));
+
+# the port is taken now
+new_call;
+
+like(rtpe_raw_req({ command => 'offer', 'call-id' => cid(), 'from-tag' => ft(),
+		ICE => 'remove', 'local-port' => 20040,
+		sdp => "v=0\r\no=- 1545997027 1 IN IP4 198.51.100.1\r\ns=tester\r\nt=0 0\r\n"
+			. "m=audio 7208 RTP/AVP 8\r\nc=IN IP4 198.51.100.1\r\na=sendrecv\r\n" }),
+	qr/Ran out of ports/, 'local port in use');
+
+# other methods that open ports
+
+new_call;
+
+publish('local port, publish', { 'local-port' => 20060 }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 7210 RTP/AVP 0 8 9
+c=IN IP4 198.51.100.14
+a=sendonly
+----------------------------------
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio 20060 RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=recvonly
+a=rtcp:20061
+SDP
+
+subscribe_request('local port, subscribe request', { 'from-tag' => ft(), 'local-port' => 20070 }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 20070 RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:20071
+SDP
+
+
+
+
+# SDES-key: the controller picks the keys
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 7200)], [qw(198.51.100.3 7202)]);
+
+($port_a) = offer('SDES key, RTP <> SRTP', {
+		ICE => 'remove',
+		DTLS => 'off',
+		'transport-protocol' => 'RTP/SAVP',
+		SDES => [ 'only-AES_CM_128_HMAC_SHA1_80', 'key-AES_CM_128_HMAC_SHA1_80:aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx' ],
+	}, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 7200 RTP/AVP 8
+c=IN IP4 198.51.100.1
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/SAVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx
+SDP
+
+($port_b) = answer('SDES key, RTP <> SRTP', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 7202 RTP/SAVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:NFXudaubTn5V0WvjJhztxASmrEP6c6/8/8bvKEAT
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$srtp_ctx_a = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx',
+};
+$srtp_ctx_b = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'NFXudaubTn5V0WvjJhztxASmrEP6c6/8/8bvKEAT',
+};
+
+     snd($sock_a, $port_b,  rtp(8, 1000, 3000, 0x1234, "\x00" x 160));
+srtp_rcv($sock_b, $port_a, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160), $srtp_ctx_a);
+srtp_snd($sock_b, $port_a,  rtp(8, 2000, 4000, 0x6543, "\x11" x 160), $srtp_ctx_b);
+     rcv($sock_a, $port_b, rtpm(8, 2000, 4000, 0x6543, "\x11" x 160));
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 7204)], [qw(198.51.100.3 7206)]);
+
+($port_a) = offer('SDES key, SRTP <> SRTP', {
+		ICE => 'remove',
+		DTLS => 'off',
+		SDES => [ 'only-AES_CM_128_HMAC_SHA1_80', 'key-AES_CM_128_HMAC_SHA1_80:aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx' ],
+	}, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 7204 RTP/SAVP 8
+c=IN IP4 198.51.100.1
+a=sendrecv
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:QjnnaukLn7iwASAs0YLzPUplJkjOhTZK2dvOwo6c
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/SAVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx
+SDP
+
+($port_b) = answer('SDES key, SRTP <> SRTP', {
+		SDES => [ 'key-AES_CM_128_HMAC_SHA1_80:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR' ],
+	}, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 7206 RTP/SAVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:NFXudaubTn5V0WvjJhztxASmrEP6c6/8/8bvKEAT
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/SAVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR
+SDP
+
+$srtp_ctx_a = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'QjnnaukLn7iwASAs0YLzPUplJkjOhTZK2dvOwo6c',
+};
+$srtp_ctx_a_rev = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR',
+};
+$srtp_ctx_b = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'NFXudaubTn5V0WvjJhztxASmrEP6c6/8/8bvKEAT',
+};
+$srtp_ctx_b_rev = {
+	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
+	key => 'aw4qXB7sWmcM3LNtx6zUM8kIEhOisrLxO/XKeOUx',
+};
+
+srtp_snd($sock_a, $port_b,  rtp(8, 1000, 3000, 0x1234, "\x00" x 160), $srtp_ctx_a);
+srtp_rcv($sock_b, $port_a, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160), $srtp_ctx_b_rev);
+srtp_snd($sock_b, $port_a,  rtp(8, 2000, 4000, 0x6543, "\x11" x 160), $srtp_ctx_b);
+srtp_rcv($sock_a, $port_b, rtpm(8, 2000, 4000, 0x6543, "\x11" x 160), $srtp_ctx_a_rev);
 
 
 

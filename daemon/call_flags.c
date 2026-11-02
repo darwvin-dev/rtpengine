@@ -40,6 +40,10 @@ static const char *ng_sdes_option(str *s, unsigned int idx, helper_arg arg) {
 	if (call_ng_flags_prefix(s, "order:", call_ng_flags_str_q_multi, &out->sdes_order))
 		return NULL;
 
+	/* Our own master key and salt for a crypto suite */
+	if (call_ng_flags_prefix(s, "key-", call_ng_flags_str_q_multi, &out->sdes_keys))
+		return NULL;
+
 	/* Crypto suite preferences for the offerer */
 	if (call_ng_flags_prefix(s, "offerer_pref:", call_ng_flags_str_q_multi,
 					&out->sdes_offerer_pref))
@@ -969,6 +973,10 @@ const char *call_ng_flags_flags(str *s, unsigned int idx, helper_arg arg) {
 		case CSH_LOOKUP("static codecs"):
 			out->static_codecs = true;
 			break;
+		case CSH_LOOKUP("stop-on-ingress"):
+		case CSH_LOOKUP("stop on ingress"):
+			out->stop_on_ingress = true;
+			break;
 		case CSH_LOOKUP("strict-source"):
 		case CSH_LOOKUP("strict source"):
 			out->strict_source = true;
@@ -1129,6 +1137,8 @@ void call_ng_flags_init(sdp_ng_flags *out, enum ng_opmode opmode) {
 	out->digit = -1;
 	out->repeat_duration = -1;
 	out->frequencies = g_array_new(false, false, sizeof(int));
+	out->local_ports = g_array_new(false, false, sizeof(int));
+	out->from_local_ports = g_array_new(false, false, sizeof(int));
 	for (int i = 0; i < __MT_MAX; ++i)
 		out->sdp_media_remove[i] = false;
 	out->t38_version = -1;
@@ -1238,26 +1248,27 @@ static void call_ng_parse_block_mode(str *s, enum block_dtmf_mode *output) {
 }
 #endif
 
-static void call_ng_flags_freqs(const ng_parser_t *parser, parser_arg value, sdp_ng_flags *out);
-static const char *call_ng_flags_freqs_iter(const ng_parser_t *parser, parser_arg item, helper_arg arg) {
-	call_ng_flags_freqs(parser, item, arg.flags);
+// an integer, a string holding one, or a list of either
+static void call_ng_flags_int_array(const ng_parser_t *parser, parser_arg value, GArray *out);
+static const char *call_ng_flags_int_array_iter(const ng_parser_t *parser, parser_arg item, helper_arg arg) {
+	call_ng_flags_int_array(parser, item, arg.generic);
 	return NULL;
 }
-static void call_ng_flags_freqs(const ng_parser_t *parser, parser_arg value, sdp_ng_flags *out) {
+static void call_ng_flags_int_array(const ng_parser_t *parser, parser_arg value, GArray *out) {
 	unsigned int val;
 
 	if (parser->is_int(value)) {
 		val = parser->get_int(value);
-		g_array_append_val(out->frequencies, val);
+		g_array_append_val(out, val);
 	}
 	else if (parser->is_list(value))
-		parser->list_iter(parser, value, NULL, call_ng_flags_freqs_iter, out);
+		parser->list_iter(parser, value, NULL, call_ng_flags_int_array_iter, out);
 	else {
 		val = parser->get_int_str(value, 0);
 		if (val)
-			g_array_append_val(out->frequencies, val);
+			g_array_append_val(out, val);
 		else
-			ilog(LOG_WARN, "Invalid content type in `frequencies` list");
+			ilog(LOG_WARN, "Invalid content type in integer list");
 	}
 }
 
@@ -1708,7 +1719,11 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 			break;
 		case CSH_LOOKUP("frequency"):
 		case CSH_LOOKUP("frequencies"):
-			call_ng_flags_freqs(parser, value, out);
+			call_ng_flags_int_array(parser, value, out->frequencies);
+			break;
+		case CSH_LOOKUP("from-local-port"):
+		case CSH_LOOKUP("from local port"):
+			call_ng_flags_int_array(parser, value, out->from_local_ports);
 			break;
 		case CSH_LOOKUP("from-interface"):
 		case CSH_LOOKUP("from interface"):
@@ -1786,6 +1801,10 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 		case CSH_LOOKUP("instance"):
 			out->instance = s;
 			break;
+		case CSH_LOOKUP("local-port"):
+		case CSH_LOOKUP("local port"):
+			call_ng_flags_int_array(parser, value, out->local_ports);
+			break;
 		case CSH_LOOKUP("media address"):
 		case CSH_LOOKUP("media-address"):
 			if (!sockaddr_parse_any_str(&out->media_address, &s))
@@ -1853,7 +1872,6 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 			break;
 		case CSH_LOOKUP("recording-media-slot-offer"):
 			// This needs to be > 0
-			//out->media_rec_slot_offer = bencode_get_integer_str(value, out->media_rec_slot_offer);
 			out->media_rec_slot_offer = parser->get_int_str(value, out->media_rec_slot_offer);
 		break;
 		case CSH_LOOKUP("recording-media-slot-answer"):
@@ -2233,6 +2251,10 @@ void call_ng_free_flags(sdp_ng_flags *flags) {
 	str_case_value_ht_destroy_ptr(&flags->codec_set);
 	if (flags->frequencies)
 		g_array_free(flags->frequencies, true);
+	if (flags->local_ports)
+		g_array_free(flags->local_ports, true);
+	if (flags->from_local_ports)
+		g_array_free(flags->from_local_ports, true);
 
 #define X(x) t_queue_clear_full(&flags->x, str_free);
 RTPE_NG_FLAGS_STR_Q_PARAMS

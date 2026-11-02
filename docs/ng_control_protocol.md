@@ -439,6 +439,11 @@ Optionally included keys are:
 	had ICE attributes listed. If the incoming SDP did not contain ICE attributes, then no
 	ICE attributes are added.
 
+	For `answer` messages, an endpoint must not negotiate ICE that was absent from
+	the corresponding offer. Prefer `ICE=default` when handling an answer from
+	a peer which might not support ICE. `ICE=force` on an answer cannot invent
+	ICE support when no ICE was offered on that leg.
+
 	With `force-relay`, existing ICE candidates are left in place except `relay`
 	type candidates, and *rtpengine* inserts itself as a `relay` candidate. It will also leave SDP
 	c= and m= lines unchanged.
@@ -498,6 +503,28 @@ Optionally included keys are:
 	A custom free-form string which *rtpengine* remembers for this participating endpoint and reports
 	back in logs and statistics output. For some commands (e.g. `block media`) the given label is not
 	used to set the label of the call participant, but rather to select an existing call participant.
+
+* `local-port` or `from-local-port`
+
+	The local port to use for a media section, instead of one taken from the port
+	pool: `local-port` for the side facing the recipient of the message (the port
+	that appears in the SDP returned by *rtpengine*), `from-local-port` for the side
+	facing its sender (in an `offer`, the port that will later appear in the SDP of
+	the answer). Either an integer, which applies to the first media section, or a
+	list of integers, one per media section of the received SDP in order, where `0`
+	means "any port". When RTCP is not multiplexed, RTCP uses the next port up.
+
+	This is meant for a controller that manages the media ports itself, for example
+	one that has already announced the ports to the remote side. The port can be
+	outside of the configured port range. A requested port only applies when
+	*rtpengine* opens the ports for a media section for the first time, typically in
+	the initial `offer`; for media that has its ports already, it is ignored. If the
+	port cannot be opened, the request fails.
+
+	`local-port` is supported by every message that opens ports for a media section
+	(`offer`, `answer`, `publish`, `subscribe request` and `create`).
+	`from-local-port` only applies to `offer` and `answer`, the only messages with a
+	sending side to open ports for.
 
 * `media address`
 
@@ -784,6 +811,18 @@ Optionally included keys are:
 
 		Flag usage example:
 		`SDES-offerer_pref:AES_256_CM_HMAC_SHA;AES_256_CM_HMAC_SHA1_32;`
+
+	- `key-`*SUITE*`:`*KEY*
+
+		Use the given master key and salt for the crypto suite *SUITE* on the side
+		facing the recipient of the message, i.e. the key in the `a=crypto` line for
+		that suite in the SDP returned by *rtpengine*, instead of a generated key or one
+		copied from the received SDP. *KEY* is the base64 encoded concatenation of the
+		master key and the master salt, as in the `inline:` key parameter of an
+		`a=crypto` attribute. Can be given once per crypto suite. Example:
+		`SDES-key-AES_CM_128_HMAC_SHA1_80:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR`
+
+		This is meant for a controller which allocates the SRTP keys itself.
 
 	- `pad`
 
@@ -1389,6 +1428,17 @@ Spaces in each string may be replaced by hyphens.
 
     Intended for feeding media into a system that has to bind a receiver to an
     SSRC up front, such as a WebRTC selective forwarding unit.
+
+* `stop on ingress`
+
+    Only useful for `play media` NG requests. With this option,
+    the `play media` plays the media to the selected call party, but only until
+    a real media for that party arrives (even a single RTP packet from the previously learned source).
+    Thus, as soon as the first RTP packet from the called call party (which would be forwarded to the
+    selected party) is received, the playback is stopped right away and the media forwarding
+    is then resumed (the same way as with a `stop media` message). It implies to `block
+    egress`, so the other parties media is not heard while the playback is
+    ongoing. See the `play media` message for all other details.
 
 * `strict source`
 
@@ -2438,6 +2488,19 @@ Media files can be provided through one of these keys:
 
 	Contains an integer. The start frame position to begin the playback from.
 
+With the `stop on ingress` flag present, the playback is replacing media from the other call parties only
+for as long as there is no real media coming. A typical use case is an emulation of ringback tone towards
+a caller while the callee has advertised the early media (e.g. `183` with SDP),
+but in fact it is rather unknown whether it actually sends any (expected to not receive any single RTP packet).
+Media from the other parties is blocked (`block egress` is implied) for a while, and then the first RTP packet
+received from any of them (which would be then forwarded to the selected participant), stops the ongoing playback
+and the media forwarding resumes. This packet itself, as well as the packets received before the playback is fully
+stopped (typically it takes few ms), are not forwarded. Important, RTCP packets don't stop the playback.
+Media that is being forwarded by the kernel module at the moment doesn't stop the playback, as it is not seen by the daemon.
+But this doesn't happen as long as the selected participant is the only destination of that media, as blocked
+destinations are excluded from kernel forwarding. Then later, any media that arrives after the playback
+has been stopped is forwarded as usual (so in kernel space) and a later `stop media` message for the same participant is harmless.
+
 In addition to the `result` key, the response dictionary may contain the key `duration` if the length of
 the media file could be determined. The duration is given as in integer representing milliseconds.
 
@@ -2614,6 +2677,7 @@ command. Sample return dictionary:
 	      "relayedpacketerrors": 0,
 	      "zerowaystreams": 0,
 	      "onewaystreams": 0,
+	      "rediswriteerrors": 0,
 	      "avgcallduration": "0.000000"
 	    },
 	    "intervalstatistics": {

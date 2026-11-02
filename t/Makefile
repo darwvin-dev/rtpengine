@@ -31,6 +31,7 @@ CFLAGS += $(CFLAGS_LIBSWSCALE)
 CFLAGS += $(CFLAGS_LIBAVFILTER)
 CFLAGS += $(CFLAGS_SPANDSP)
 CFLAGS += $(CFLAGS_OPUS)
+CFLAGS += $(CFLAGS_CODEC2)
 CFLAGS += $(CFLAGS_LIBZ)
 CFLAGS += $(CFLAGS_LIBWEBSOCKETS)
 CFLAGS += $(CFLAGS_LIBEVENT)
@@ -67,6 +68,7 @@ LDLIBS += $(LDLIBS_LIBEVENT)
 LDLIBS += $(LDLIBS_LIBHIREDIS)
 LDLIBS += $(LDLIBS_MYSQL)
 LDLIBS += $(LDLIBS_BCG729)
+LDLIBS += $(LDLIBS_CODEC2)
 endif
 
 CFLAGS += $(CFLAGS_CODEC_CHAIN)
@@ -88,12 +90,15 @@ include ../lib/common.Makefile
 	daemon-tests-transform daemon-tests-http daemon-tests-heuristic daemon-tests-asymmetric \
 	daemon-tests-dtx-no-shift daemon-tests-rtcp daemon-tests-redis-subscribe daemon-tests-rtp-ext daemon-tests-ssrc \
 	daemon-tests-bundle daemon-tests-dtls daemon-tests-rollback \
-	daemon-tests-rollback-redis daemon-tests-redis-srtp-index \
-	daemon-tests-recording daemon-tests-create daemon-tests-created-subscriptions daemon-tests-alias \
-	daemon-tests-kernel-api \
-	daemon-tests-video daemon-tests-inject daemon-tests-dtx-dtmf
+	daemon-tests-rollback-redis daemon-tests-redis-srtp-index daemon-tests-redis-errors \
+	daemon-tests-redis-destroyed daemon-tests-redis-reconnect \
+	daemon-tests-recording daemon-tests-create daemon-tests-create-srtp daemon-tests-created-subscriptions daemon-tests-alias \
+	daemon-tests-kernel-api daemon-tests-dtmf-fanout \
+	daemon-tests-video daemon-tests-inject daemon-tests-dtx-dtmf \
+	daemon-tests-roc-pl \
+	daemon-tests-ice-force-answer
 
-TESTS := test-bitstr aes-crypt aead-aes-crypt test-const_str_hash.strhash
+TESTS := test-bitstr test-str aes-crypt aead-aes-crypt test-const_str_hash.strhash
 ifeq ($(with_transcoding),yes)
 TESTS += test-transcode test-dtmf-detect test-payload-tracker test-resample test-stats test-mix-buffer
 TESTS += test-sequencer
@@ -141,12 +146,15 @@ daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-pubsub daemon-tests
 	daemon-tests-transcode-config daemon-tests-codec-prefs daemon-tests-http daemon-tests-heuristic \
 	daemon-tests-asymmetric daemon-tests-rtcp daemon-tests-redis-subscribe daemon-tests-rtp-ext daemon-tests-ssrc \
 	daemon-tests-bundle daemon-tests-dtls daemon-tests-rollback daemon-tests-rollback-redis \
-	daemon-tests-redis-srtp-index \
-	daemon-tests-recording daemon-tests-create daemon-tests-created-subscriptions \
+	daemon-tests-redis-srtp-index daemon-tests-redis-errors daemon-tests-redis-destroyed \
+	daemon-tests-redis-reconnect \
+	daemon-tests-recording daemon-tests-create daemon-tests-create-srtp daemon-tests-created-subscriptions \
+	daemon-tests-ice-force-answer \
 	daemon-tests-dtx daemon-tests-dtx-cn daemon-tests-dtx-no-shift daemon-tests-dtx-dtmf \
 	daemon-tests-alias \
-	daemon-tests-kernel-api \
-	daemon-tests-video daemon-tests-inject
+	daemon-tests-kernel-api daemon-tests-dtmf-fanout \
+	daemon-tests-video daemon-tests-inject \
+	daemon-tests-roc-pl
 
 daemon-test-deps:	tests-preload.so
 	$(MAKE) -C ../daemon
@@ -172,6 +180,9 @@ daemon-tests-redis-srtp-index:	daemon-test-deps
 daemon-tests-jb:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-jb.pl
 
+daemon-tests-roc-pl:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-roc-pl.pl
+
 daemon-tests-heuristic:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-heuristic.pl
 
@@ -184,6 +195,9 @@ daemon-tests-dtx:	daemon-test-deps
 daemon-tests-dtx-dtmf:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-dtx-dtmf.pl
 
+daemon-tests-dtmf-fanout:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-dtmf-fanout.pl
+
 daemon-tests-dtx-no-shift:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-dtx-no-shift.pl
 
@@ -195,6 +209,9 @@ daemon-tests-pubsub:	daemon-test-deps
 
 daemon-tests-create:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-create.pl
+
+daemon-tests-create-srtp:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-create-srtp.pl
 
 daemon-tests-created-subscriptions:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-created-subscriptions.pl
@@ -237,6 +254,15 @@ daemon-tests-redis-subscribe:	daemon-test-deps
 
 daemon-tests-redis-json:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-redis-json.pl
+
+daemon-tests-redis-errors:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-redis-errors.pl
+
+daemon-tests-redis-destroyed:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-redis-destroyed.pl
+
+daemon-tests-redis-reconnect:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-redis-reconnect.pl
 
 daemon-tests-audio-player:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-audio-player.pl
@@ -320,6 +346,9 @@ daemon-tests-bundle:	daemon-test-deps
 daemon-tests-dtls:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-dtls.pl
 
+daemon-tests-ice-force-answer:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-ice-force-answer.pl
+
 daemon-tests-recording:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-recording.pl
 
@@ -327,6 +356,8 @@ daemon-tests-kernel-api:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-kernel-api.pl
 
 test-bitstr:	test-bitstr.o
+
+test-str:	test-str.o
 
 test-mix-buffer:	test-mix-buffer.o \
 	$(COMMONOBJS) \
@@ -516,6 +547,7 @@ test-transcode:	test-transcode.o \
 	../lib/bencode.o \
 	../lib/bufferpool.o \
 	../lib/cchain.o \
+	../lib/codec2.o \
 	../lib/codeclib.o \
 	../lib/dtmflib.o \
 	../lib/g711.o \

@@ -274,7 +274,6 @@ sub encrypt_rtp {
 	$seq == 0 and $roc++;
 
 	my ($exttype, $extlen, $ext) = ('', '', '');
-	print(unpack('H*', $hdr) . "\n");
 	if ((unpack('C', $hdr))[0] & 0x10) {
 		# extension
 		my $rest;
@@ -381,6 +380,7 @@ sub decrypt_rtcp {
 	my $pkt = $hdr . $enc;
 
 	my $hmac = hmac_sha1($auth_packet, $sauth);
+	#print("HMAC for packet " . unpack("H*", $pkt) . " idx $idx is " . unpack("H*", $hmac) . " vs "  . unpack("H*", $auth_tag) . "\n");
 
 	return ($pkt, $idx, $auth_tag, $hmac);
 }

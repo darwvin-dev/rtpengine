@@ -233,6 +233,7 @@ struct codec_ssrc_handler {
 	uint64_t skip_pts;
 
 	bool rtp_mark;
+	bool decode_only; // consumes without replacing: doesn't move the seq offset
 };
 struct transcode_packet {
 	seq_packet_t p; // must be first
@@ -2422,14 +2423,18 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		}
 
 		ssrc_in->packets_lost = seq->lost_count;
-		atomic_set_na(&ssrc_in->stats->ext_seq, seq->ext_seq);
+		// stats->ext_seq is the SRTP receive index (packet_index() in rtp.c and the
+		// kernel module) and is already updated for every received packet. The
+		// sequencer's position is an emission position that can legitimately move
+		// backwards, so it must not be written into the receive index.
 
 		ilogs(transcoding, LOG_DEBUG, "Processing RTP packet: seq %u, TS %lu",
 				packet->p.seq, packet->ts);
 
 		if (seq_ret == 1) {
 			// seq reset - update output seq. we keep our output seq clean
-			ssrc_out->seq_diff -= packet->p.seq - seq_ori;
+			if (!ch->decode_only)
+				ssrc_out->seq_diff -= packet->p.seq - seq_ori;
 			seq_ret = 0;
 		}
 
@@ -2727,8 +2732,13 @@ static int packet_dtmf_event(struct codec_ssrc_handler *ch, struct codec_ssrc_ha
 {
 	LOCK(&mp->media->dtmf_lock);
 
-	if (mp->media->dtmf_ts == packet->ts)
+	if (mp->media->dtmf_ts == packet->ts) {
+		// The event is deduplicated per media, but suppression is tracked per
+		// input handler. Clear it for every destination that saw this event.
+		if (input_ch->dtmf_start_ts == packet->ts)
+			input_ch->dtmf_start_ts = 0;
 		return 1; // ignore already processed events
+	}
 
 	int ret = dtmf_event_packet(mp, packet->payload, ch->handler->source_pt.clock_rate, packet->ts);
 	if (G_UNLIKELY(ret == -1)) // error
@@ -4024,7 +4034,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 		// release and try again
 		mutex_unlock(&dtxb->lock);
 
-		if (call && mp_copy.ssrc_out) {
+		if (call && mp_copy.ssrc_out && !ch->decode_only) {
 			// packet consumed - track seq
 			rwlock_lock_r(&call->master_lock);
 			__ssrc_lock_both(&mp_copy);
@@ -4537,6 +4547,7 @@ static struct ssrc_entry *__ssrc_handler_decode_new(void *p) {
 
 	__auto_type ch = obj_alloc0(struct codec_ssrc_handler, __free_ssrc_handler);
 	ch->handler = h;
+	ch->decode_only = true;
 	ch->ptime = h->dest_pt.ptime;
 
 	format_t dest_format = {
@@ -4892,7 +4903,8 @@ static tc_code __rtp_decode_direct(struct codec_ssrc_handler *ch, struct codec_s
 			code = ret == 0 ? TCC_OK : TCC_ERR;
 		}
 	}
-	__buffer_delay_seq(input_ch->handler->delay_buffer, mp, -1);
+	if (!ch->decode_only) // consumed, not replaced: doesn't count towards the seq offset
+		__buffer_delay_seq(input_ch->handler->delay_buffer, mp, -1);
 	return code;
 }
 static tc_code __rtp_decode_async(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,

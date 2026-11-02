@@ -1375,6 +1375,34 @@ fail:
 	return false;
 }
 
+/**
+ * Like get_consecutive_ports(), but for the ports port ... port + num_ports - 1 exactly,
+ * all or nothing. The ports may be outside of the pool.
+ */
+bool get_specific_ports(socket_port_q *out, unsigned int num_ports, unsigned int port,
+		struct local_intf *loc, const str *label)
+{
+	if (!num_ports || !port || port + num_ports - 1 > 65535) {
+		ilog(LOG_ERR, "Invalid local port %u (%u ports) requested", port, num_ports);
+		return false;
+	}
+
+	for (unsigned int i = 0; i < num_ports; i++) {
+		__auto_type spl = get_specific_port(port + i, loc->spec, label);
+		if (!spl.socket.family) {
+			ilog(LOG_ERR, "Failed to open requested local port %u on interface %s",
+					port + i, sockaddr_print_buf(&loc->spec->local_address.addr));
+			release_reserved_ports(out);
+			return false;
+		}
+		__auto_type splp = g_new(struct socket_port_link, 1);
+		*splp = spl;
+		i_queue_push_tail(out, splp);
+	}
+
+	return true;
+}
+
 bool get_consecutive_ports(socket_port_q *out, unsigned int num_ports, struct local_intf *loc,
 		const str *label)
 {
@@ -1529,7 +1557,7 @@ static void fill_bundle_pt_stats(kernelize_state *s, struct call_media *bundle, 
 	__auto_type iter = t_hash_table_iter(bundle->pt_media);
 	void *pt;
 	struct call_media *pt_media;
-	while (t_hash_table_iter_next(&iter, &pt, &pt_media)) {
+	while (t_hash_table_iter_next(&iter, &pt, &pt_media) && s->num_payload_types < RTPE_NUM_PAYLOAD_TYPES) {
 		struct packet_stream *pt_ps = get_media_component(pt_media, component);
 		if (!pt_ps)
 			continue; // log as error?
@@ -1762,6 +1790,11 @@ static const char *kernelize_target(kernelize_state *s, struct packet_stream *st
 	return NULL;
 }
 
+// the kernel's ssrc_subst cases: echo, transcoding or a fixed egress SSRC
+static bool sink_substitutes_ssrc(struct call_media *in, const struct sink_handler *sh, struct call_media *out) {
+	return MEDIA_ISSET(in, ECHO) || sh->attrs.transcoding || (out && out->fixed_egress_ssrc);
+}
+
 /**
  * The linkage between userspace and kernel module is in the kernelize_one().
  *
@@ -1861,8 +1894,7 @@ static const char *kernelize_one(kernelize_state *s,
 
 	}
 
-	if (MEDIA_ISSET(media, ECHO) || sink_handler->attrs.transcoding
-			|| sink->media->fixed_egress_ssrc)
+	if (sink_substitutes_ssrc(media, sink_handler, sink->media))
 		redi->output.ssrc_subst = 1;
 
 	__re_address_translate_ep(&redi->output.dst_addr, &sink->endpoint);
@@ -2595,7 +2627,7 @@ const struct streamhandler *determine_sink_handler(struct packet_stream *in, str
 		must_recrypt = true;
 	else if (ML_ISSET(in->media->monologue, INJECT_DTMF) || (out && ML_ISSET(out->media->monologue, INJECT_DTMF)))
 		must_recrypt = true;
-	else if (sh->attrs.transcoding)
+	else if (sink_substitutes_ssrc(media_in, sh, media_out)) // the header is rewritten: the packet is encrypted anew
 		must_recrypt = true;
 	else if (in->call->recording)
 		must_recrypt = true;
@@ -3023,11 +3055,11 @@ static void media_packet_rtp_out(struct packet_handler_ctx *phc, struct sink_han
 
 	const char *unkern = NULL;
 
-	uint32_t fixed_ssrc = phc->mp.media_out->fixed_egress_ssrc;
+	uint32_t fixed_ssrc = phc->mp.ssrc_in ? phc->mp.media_out->fixed_egress_ssrc : 0;
 
 	/* A fixed egress SSRC is just a mapping from the ingress SSRC, so record it
 	 * where every consumer already looks for one. */
-	if (fixed_ssrc && phc->mp.ssrc_in)
+	if (fixed_ssrc)
 		phc->mp.ssrc_in->ssrc_map_out = fixed_ssrc;
 
 	if (G_LIKELY(!phc->rtcp && phc->mp.rtp)) {
@@ -3037,7 +3069,7 @@ static void media_packet_rtp_out(struct packet_handler_ctx *phc, struct sink_han
 
 		/* a fixed egress SSRC outlives the ingress SSRC, so carry the
 		 * sequence numbering across a change of source */
-		if (fixed_ssrc && phc->mp.ssrc_out) {
+		if (fixed_ssrc) {
 			struct ssrc_entry_call *so = phc->mp.ssrc_out;
 			uint32_t in_ssrc = ntohl(phc->mp.rtp->ssrc);
 			uint16_t seq = ntohs(phc->mp.rtp->seq_num);
@@ -3459,6 +3491,22 @@ void media_packet_release(struct media_packet *mp) {
 }
 
 
+// gives a sink its own copy of the packet to rewrite, with the header, payload and extensions pointing into it
+static void media_packet_sink_copy(struct media_packet *mp, GQueue *free_list) {
+	char *buf = bufferpool_alloc(media_bufferpool, mp->raw.len + RTP_BUFFER_TAIL_ROOM);
+	memcpy(buf, mp->raw.s, mp->raw.len);
+	g_queue_push_tail(free_list, buf);
+	if (mp->rtp)
+		mp->rtp = (void *) (buf + ((char *) mp->rtp - mp->raw.s));
+	if (mp->rtcp)
+		mp->rtcp = (void *) (buf + ((char *) mp->rtcp - mp->raw.s));
+	if (mp->payload.s)
+		mp->payload.s = buf + (mp->payload.s - mp->raw.s);
+	if (mp->extensions.s)
+		mp->extensions.s = buf + (mp->extensions.s - mp->raw.s);
+	mp->raw.s = buf;
+}
+
 static int media_packet_queue_dup(codec_packet_q *q) {
 	IQUEUE_FOREACH(q, p) {
 		if (p->free_func) // nothing to do, already private
@@ -3633,11 +3681,25 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 
 	///////////////// EGRESS HANDLING
 
-	str orig_raw = STR_NULL;
+	// the handlers may rewrite the packet in place, but we may have multiple outputs: every sink
+	// starts from the packet as received and gets its own copy of it unless it's the last one
+	const str orig_raw = phc->mp.raw;
+	struct rtp_header *const orig_rtp = phc->mp.rtp;
+	struct rtcp_packet *const orig_rtcp = phc->mp.rtcp;
+	const str orig_payload = phc->mp.payload;
+	const str orig_extensions = phc->mp.extensions;
 
 	for (__auto_type sh_link = phc->sinks->head; sh_link; sh_link = sh_link->next) {
 		struct sink_handler *sh = sh_link->data;
 		struct packet_stream *sink = sh->bundle_sink;
+
+		phc->mp.raw = orig_raw;
+		phc->mp.rtp = orig_rtp;
+		phc->mp.rtcp = orig_rtcp;
+		phc->mp.payload = orig_payload;
+		phc->mp.extensions = orig_extensions;
+		if (sh_link->next)
+			media_packet_sink_copy(&phc->mp, &free_list);
 
 		// this sets rtcp, in_srtp, out_srtp, media_out, and sink
 		media_packet_rtcp_mux(phc, sh);
@@ -3650,16 +3712,6 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 		if (phc->rtcp) {
 			phc->rtcp_discard = false;
 			handler_ret = -1;
-			// these functions may do in-place rewriting, but we may have multiple
-			// outputs - make a copy if this isn't the last sink
-			if (sh_link->next) {
-				if (!orig_raw.s)
-					orig_raw = phc->mp.raw;
-				char *buf = bufferpool_alloc(media_bufferpool, orig_raw.len + RTP_BUFFER_TAIL_ROOM);
-				memcpy(buf, orig_raw.s, orig_raw.len);
-				phc->mp.raw.s = buf;
-				g_queue_push_tail(&free_list, buf);
-			}
 			if (do_rtcp_parse(phc))
 				goto out;
 			if (phc->rtcp_discard)
@@ -3694,6 +3746,10 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 				goto err_next;
 		}
 		else {
+			/* the real media from another party may end a `stop-on-ingress` playback */
+			if (phc->mp.rtp && phc->mp.media_out->monologue != phc->mp.media->monologue)
+				media_player_check_stop_on_ingress(phc->mp.media_out);
+
 			struct codec_handler *transcoder = codec_handler_get(phc->mp.media, phc->payload_type,
 					phc->mp.media_out, sh);
 			// this transfers the packet from 's' to 'packets_out'
@@ -4097,7 +4153,7 @@ stream_fd *stream_fd_new(struct socket_port_link *spl, call_t *call, struct loca
 	dbg_int("stream_fd_new localport=%d", sfd->socket.local.port);
 
 	ZERO(pi);
-	pi.fd = sfd->socket.fd;
+	pi.u.fd = sfd->socket.fd;
 	pi.obj = &sfd->obj;
 	pi.readable = stream_fd_readable;
 	pi.writeable = stream_fd_writeable;

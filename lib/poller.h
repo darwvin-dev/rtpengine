@@ -24,8 +24,16 @@ struct sockaddr;
 
 typedef void (*poller_func_t)(int, void *);
 
+union poller_item_u64 {
+	struct {
+		int fd;
+		int32_t gen;
+	} __attribute__((packed));
+	uint64_t u64;
+};
+
 struct poller_item {
-	int				fd;
+	union poller_item_u64		u;
 	struct obj			*obj;
 
 	poller_func_t			readable;
@@ -33,6 +41,8 @@ struct poller_item {
 	poller_func_t			writeable;
 	poller_func_t			closed;
 };
+
+static_assert(sizeof(union poller_item_u64) == sizeof(uint64_t), "wrong packing of union poller_item_u64");
 
 struct poller;
 

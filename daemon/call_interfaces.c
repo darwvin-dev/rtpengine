@@ -692,7 +692,7 @@ static const char *call_offer_answer_ng(ng_command_ctx_t *ctx, const char *addr)
 
 		/* report the SSRCs picked for media sent towards the recipient of this SDP,
 		 * one entry per m= section */
-		if (flags.fixed_egress_ssrc && to_ml->medias) {
+		if (flags.fixed_egress_ssrc) {
 			parser_arg ssrcs = parser->dict_add_list(output, "egress SSRC");
 			for (unsigned int i = 0; i < to_ml->medias->len; i++) {
 				struct call_media *media = to_ml->medias->pdata[i];
@@ -1144,7 +1144,7 @@ static void ng_stats_ssrc_1(const ng_parser_t *parser, parser_arg ent, struct ss
 
 	parser->dict_add_int(ent, "cumulative loss", se->packets_lost);
 
-	int mos_samples = se->stats_blocks.length - se->no_mos_count;
+	int mos_samples = se->mos_samples;
 	if (mos_samples < 1) mos_samples = 1;
 	ng_stats_ssrc_mos_entry_dict_avg(parser, ent, "average MOS", &se->average_mos, mos_samples);
 	ng_stats_ssrc_mos_entry_dict(parser, ent, "lowest MOS", se->lowest_mos);
@@ -1152,7 +1152,7 @@ static void ng_stats_ssrc_1(const ng_parser_t *parser, parser_arg ent, struct ss
 
 	parser_arg progdict = parser->dict_add_dict(ent, "MOS progression");
 	// aim for about 10 entries to the list
-	GList *listent = se->stats_blocks.head;
+	__auto_type listent = se->stats_blocks.head;
 	struct ssrc_stats_block *sb = listent->data;
 	int64_t interval
 		= ((struct ssrc_stats_block *) se->stats_blocks.tail->data)->reported
@@ -2002,7 +2002,9 @@ const char *call_play_media_ng(ng_command_ctx_t *ctx) {
 				.repeat = flags.repeat_times,
 				.duration_spent = flags.repeat_duration,
 				.start_pos = flags.start_pos,
-				.block_egress = !!flags.block_egress,
+				/* other parties media must stay blocked until it takes over */
+				.block_egress = flags.block_egress || flags.stop_on_ingress,
+				.stop_on_ingress = !!flags.stop_on_ingress,
 				.codec_set = flags.codec_set,
 				.file = flags.file,
 				.blob = flags.blob,

@@ -590,7 +590,9 @@ out:;
 		ps->a_nxt = -1u;
 
 	unsigned int ext_seq = ps->roc << 16 | packet->seq;
-	while (ext_seq < ps->ext_seq) {
+	// a lower seq is a rollover only if it is far behind (forward wrap-around),
+	// not when a late or replayed packet is emitted
+	while (ext_seq < ps->ext_seq && ps->ext_seq - ext_seq >= 0x8000) {
 		ps->roc++;
 		ext_seq += 0x10000;
 	}
@@ -629,7 +631,8 @@ int packet_sequencer_insert(packet_sequencer_t *ps, seq_packet_t *p) {
 	if (G_LIKELY(diff >= 0 && diff < G_N_ELEMENTS(ps->packets)))
 		goto seq_ok;
 	// early packet with wrap-around: p->seq = 20, ps->a_seq = 65530, diff = -65510
-	if (diff < (-0xffff + (signed) G_N_ELEMENTS(ps->packets)))
+	// (a packet exactly one ring size ahead is a seq reset, same as without wrap-around)
+	if (diff < (-0x10000 + (signed) G_N_ELEMENTS(ps->packets)))
 		goto seq_ok;
 	// recent duplicate: p->seq = 1000, ps->seq = 1080, diff = -80
 	if (diff < 0 && diff > -(signed) G_N_ELEMENTS(ps->packets)) {
@@ -664,9 +667,11 @@ seq_ok:
 	if (ps->a_idx != idx)
 		ret = 2; // indicates an out-of-order packet
 
-	// if not set
-	if (ps->a_nxt == -1u)
-		ps->a_nxt = idx;
+	// if not set and this is the first packet
+	if (ps->a_nxt == -1u) {
+		if (ret != 2)
+			ps->a_nxt = idx;
+	}
 	// or if new idx is less than a_nxt
 	else if ((ps->a_nxt - ps->a_idx) % G_N_ELEMENTS(ps->packets)
 			> (idx - ps->a_idx) % G_N_ELEMENTS(ps->packets))

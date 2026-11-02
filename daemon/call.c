@@ -126,9 +126,9 @@ static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 	bool recv_checked = false;
 	int tmp_t_reason = UNKNOWN;
 	enum call_stream_state css;
-	int64_t timestamp;
 
 	hlp->count++;
+	rtpe_now = now_us();
 
 	rwlock_lock_r(&c->master_lock);
 	log_info_call(c);
@@ -171,7 +171,8 @@ static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 	ice_fragments_cleanup(c->sdp_fragments, false);
 
 	IQUEUE_FOREACH(&c->streams, ps) {
-		timestamp = packet_stream_last_packet(ps);
+		int64_t last_packet = packet_stream_last_packet(ps);
+		int64_t timestamp = last_packet;
 
 		if (!ps->media)
 			continue;
@@ -194,19 +195,22 @@ static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 		if (css == CSS_ICE)
 			timestamp = atomic64_get_na(&ps->media->ice_agent->last_activity);
 
+		int64_t last_kernel_packet = atomic64_get_na(&ps->stats_in->last_packet_us);
+		int64_t last_user_packet = atomic64_get_na(&ps->last_packet_us);
+
 		if (PS_ISSET(ps, RTP)) {
-			if (rtpe_now - atomic64_get_na(&ps->stats_in->last_packet_us) < 2000000LL) {
+			if (rtpe_now - last_kernel_packet < 2000000LL) {
 				// kernel activity
-				if (rtpe_now - atomic64_get_na(&ps->last_packet_us) < 2000000LL)
+				if (rtpe_now - last_user_packet < 2000000LL)
 					hlp->user_kernel_streams++; // user activity
 				else
 					hlp->kernel_streams++;
 			}
-			else if (rtpe_now - atomic64_get_na(&ps->last_packet_us) < 2000000LL)
+			else if (rtpe_now - last_user_packet < 2000000LL)
 				hlp->user_streams++; // user activity
 		}
 
-		bool active_media = (rtpe_now - packet_stream_last_packet(ps) < 1000000LL);
+		bool active_media = (rtpe_now - last_packet < 1000000LL);
 		if (active_media)
 			CALL_CLEAR(sfd->call, FOREIGN_MEDIA);
 
@@ -248,7 +252,7 @@ no_sfd:
 		for (__auto_type l = media->ssrc_hash_in.nq.head; l; l = l->next) {
 			struct ssrc_entry_call *ctx = l->data;
 
-			if (rtpe_now - atomic64_get_na(&ctx->stats->last_packet_us) < 2000000L)
+			if (rtpe_now - (int64_t) atomic64_get_na(&ctx->stats->last_packet_us) < 2000000L)
 				payload_tracker_add(&ctx->tracker,
 						atomic_get_na(&ctx->stats->last_pt));
 		}
@@ -256,7 +260,7 @@ no_sfd:
 		for (__auto_type l = media->ssrc_hash_out.nq.head; l; l = l->next) {
 			struct ssrc_entry_call *ctx = l->data;
 
-			if (rtpe_now - atomic64_get_na(&ctx->stats->last_packet_us) < 2000000L)
+			if (rtpe_now - (int64_t )atomic64_get_na(&ctx->stats->last_packet_us) < 2000000L)
 				payload_tracker_add(&ctx->tracker,
 						atomic_get_na(&ctx->stats->last_pt));
 		}
@@ -267,7 +271,7 @@ no_sfd:
 			goto out;
 
 		// update every 5 minutes
-		if (has_srtp && rtpe_now - atomic64_get_na(&c->last_redis_update_us) > 60*5*1000000LL)
+		if (has_srtp && rtpe_now - (int64_t) atomic64_get_na(&c->last_redis_update_us) > 60*5*1000000LL)
 			do_update = true;
 
 		goto out;
@@ -834,6 +838,18 @@ static struct endpoint_map *__hunt_endpoint_map(struct call_media *media, unsign
 	return NULL;
 }
 
+/* "local-port" and "from-local-port": the port requested for this media section, for
+ * endpoint maps that don't have their ports open yet */
+static void __endpoint_map_want_port(struct endpoint_map *em, const GArray *ports, unsigned int idx) {
+	if (!em || !ports || idx >= ports->len)
+		return;
+	for (auto_iter(l, em->intf_sfds.head); l; l = l->next) {
+		if (l->data->list.length)
+			return;
+	}
+	em->wanted_port = g_array_index(ports, unsigned int, idx);
+}
+
 static struct endpoint_map *__get_endpoint_map(struct call_media *media, unsigned int num_ports,
 		const struct endpoint *ep, const sdp_ng_flags *flags, bool always_reuse)
 {
@@ -856,6 +872,7 @@ static struct endpoint_map *__get_endpoint_map(struct call_media *media, unsigne
 	if (em) {
 		if (__endpoint_map_truncate(em, want_interfaces, num_ports)) {
 			media->endpoint_map = em;
+			__endpoint_map_want_port(em, flags ? flags->local_ports : NULL, media->index - 1);
 			return em;
 		}
 	}
@@ -880,6 +897,8 @@ static struct endpoint_map *__get_endpoint_map(struct call_media *media, unsigne
 		em_il->local_intf = intf->data;
 		t_queue_push_tail(&em->intf_sfds, em_il);
 	}
+
+	__endpoint_map_want_port(em, flags ? flags->local_ports : NULL, media->index - 1);
 
 	return em;
 }
@@ -1426,6 +1445,14 @@ static void __ice_offer(const sdp_ng_flags *flags, struct call_media *this,
 	if (flags->ice_reject)
 		MEDIA_CLEAR(other, ICE);
 
+	// An answer must not introduce ICE where the original offer did not
+	// advertise it. A locally created ICE agent means we intentionally
+	// offered ICE on this leg, in which case keep the negotiated state.
+	// In other cases ignore ICE=force on the answer (see issue #2161).
+	if (flags->opmode == OP_ANSWER && flags->ice_option == ICE_FORCE &&
+			!MEDIA_ISSET(other, ICE) && !this->ice_agent)
+		MEDIA_CLEAR(this, ICE);
+
 	if (flags->passthrough_on) {
 		ilog(LOG_DEBUG, "enabling passthrough mode");
 		MEDIA_SET(this, PASSTHRU);
@@ -1588,6 +1615,44 @@ static bool reorder_sdes_preferences(sdes_q *sdes_in, const str_q *offered_order
 	}
 
 	return ret;
+}
+
+/* "SDES-key-SUITE:KEY": use the given master key and salt (base64, as in a=crypto)
+ * instead of generated or copied ones */
+static void __sdes_keys(const sdp_ng_flags *flags, sdes_q *cpq) {
+	for (auto_iter(k, flags->sdes_keys.head); k; k = k->next) {
+		str b64 = *k->data, name;
+		if (!str_token(&name, &b64, ':') || !b64.len) {
+			ilogs(crypto, LOG_WARN, "Invalid SDES key '" STR_FORMAT "'", STR_FMT(k->data));
+			continue;
+		}
+		const struct crypto_suite *cs = crypto_find_suite(&name);
+		if (!cs) {
+			ilogs(crypto, LOG_WARN, "Unknown crypto suite '" STR_FORMAT "' in SDES key",
+					STR_FMT(&name));
+			continue;
+		}
+
+		/* the whole value is the key: at most its base64 padding may follow */
+		unsigned char buf[SRTP_MAX_MASTER_KEY_LEN + SRTP_MAX_MASTER_SALT_LEN];
+		str pad = b64;
+		str_shift(&pad, crypto_key_salt_b64_len(cs));
+		while (pad.len && pad.s[0] == '=')
+			str_shift(&pad, 1);
+		if (pad.len || !crypto_decode_key_salt(cs, &b64, buf)) {
+			ilogs(crypto, LOG_WARN, "Invalid SDES key for '%s', expected %u bytes in base64",
+					cs->name, cs->master_key_len + cs->master_salt_len);
+			continue;
+		}
+
+		for (__auto_type l = cpq->head; l; l = l->next) {
+			struct crypto_params_sdes *cps = l->data;
+			if (cps->params.crypto_suite != cs)
+				continue;
+			memcpy(cps->params.master_key, buf, cs->master_key_len);
+			memcpy(cps->params.master_salt, buf + cs->master_key_len, cs->master_salt_len);
+		}
+	}
 }
 
 /**
@@ -1908,6 +1973,8 @@ cps_match:
 		}
 	}
 
+	__sdes_keys(flags, cpq);
+
 skip_sdes:
 	if (is_offer) {
 		if (MEDIA_ISSET(this, DTLS) && !this->fp_hash_func && flags->dtls_fingerprint.len)
@@ -2222,12 +2289,12 @@ static void __dtls_logic(const sdp_ng_flags *flags,
 
 
 static void __ice_init(struct call_media *media) {
-	if (MEDIA_ISSET(media, PASSTHRU)) {
+	if (!MEDIA_ISSET(media, ICE) || MEDIA_ISSET(media, PASSTHRU)) {
+		/* for the ice part: not doing ICE anymore with this peer,
+		 * discard this agent, so that ice offered again later starts afresh */
 		ice_shutdown(&media->ice_agent);
 		return;
 	}
-	if (!MEDIA_ISSET(media, ICE)) /* don't init new ICE agent but leave it running if there is one */
-		return;
 
 	ice_agent_init(&media->ice_agent, media);
 }
@@ -3770,7 +3837,11 @@ static bool media_open_ports(struct call_media *media) {
 		MEDIA_CLEAR(media, PUBLIC);
 
 		socket_port_q q = IQUEUE_INIT;
-		if (!get_consecutive_ports(&q, em->num_ports, em_il->local_intf, label))
+		if (em->wanted_port) {
+			if (!get_specific_ports(&q, em->num_ports, em->wanted_port, em_il->local_intf, label))
+				return false;
+		}
+		else if (!get_consecutive_ports(&q, em->num_ports, em_il->local_intf, label))
 			return false;
 
 		struct socket_port_link *spl;
@@ -3939,8 +4010,10 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 				flags->opmode == OP_OFFER ? media_extmap_strip_mask : media_extmap_strip, flags);
 
 		if (flags->opmode == OP_OFFER) {
-			ilog(LOG_DEBUG, "Setting media recording slots to %u", flags->media_rec_slot_offer);
-			sender_media->media_rec_slot = receiver_media->media_rec_slot = flags->media_rec_slot_answer;
+			ilog(LOG_DEBUG, "Setting media recording slots to %d/%d",
+					flags->media_rec_slot_offer, flags->media_rec_slot_answer);
+			sender_media->media_rec_slot = flags->media_rec_slot_offer;
+			receiver_media->media_rec_slot = flags->media_rec_slot_answer;
 		}
 
 		codecs_offer_answer(receiver_media, sender_media, sp, flags);
@@ -4042,6 +4115,8 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 			if (!__wildcard_endpoint_map(sender_media, num_ports_other))
 				goto error_ports;
 		}
+
+		__endpoint_map_want_port(sender_media->endpoint_map, flags->from_local_ports, sp->index - 1);
 
 		update_init_subscribers(sender_media, sp, flags, flags->opmode);
 		__update_init_medias(&old_medias, flags->opmode);
@@ -4470,6 +4545,7 @@ int monologue_publish(struct call_monologue *ml, sdp_streams_q *streams, sdp_ng_
 		media_update_type(media, sp);
 		media_update_protocol(media, sp);
 		media_update_media_id(media, sp);
+		media_update_label(media, flags, &sp->label);
 		media_loop_protect(sp, media);
 		media_update_flags(media, sp);
 		media_update_crypto(media, sp, flags);
@@ -5356,7 +5432,7 @@ void call_destroy(call_t *c) {
 
 				if (!se->stats_blocks.length || !se->lowest_mos || !se->highest_mos)
 					continue;
-				int mos_samples = (se->stats_blocks.length - se->no_mos_count);
+				int mos_samples = se->mos_samples;
 				if (mos_samples < 1) mos_samples = 1;
 
 				ilog(LOG_INFO, "--- SSRC %s%" PRIx32 "%s", FMT_M(se->h.ssrc));
@@ -6781,6 +6857,10 @@ static bool monologue_call_create_media(struct call_monologue *ml, sdp_ng_flags 
 	bf_set(&m->media_flags, MEDIA_FLAG_SEND | MEDIA_FLAG_RECV
 			| MEDIA_FLAG_SETUP_ACTIVE | MEDIA_FLAG_SETUP_PASSIVE
 			| MEDIA_FLAG_DTLS | MEDIA_FLAG_SDES);
+	if (flags->dtls_off)
+		MEDIA_CLEAR(m, DTLS);
+	if (flags->sdes_off)
+		MEDIA_CLEAR(m, SDES);
 
 	__rtcp_mux_set(flags, m);
 	media_init_from_flags(m, flags);
@@ -6812,6 +6892,7 @@ static bool monologue_call_create_media(struct call_monologue *ml, sdp_ng_flags 
 
 	if (!__get_endpoint_map(m, num_ports, NULL, NULL, true))
 		return false;
+	__endpoint_map_want_port(m->endpoint_map, flags->local_ports, m->index - 1);
 	__num_media_streams(m, num_ports);
 
 	if (!__init_streams(m, NULL, flags))
@@ -6903,6 +6984,8 @@ bool monologue_call_create_answer(struct call_monologue *ml, sdp_ng_flags *flags
 
 		sdp_sp_move(&media->sp, sp);
 	}
+
+	monologue_media_start(ml);
 
 	return true;
 }

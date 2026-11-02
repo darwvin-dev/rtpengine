@@ -1080,7 +1080,11 @@ static void target_put(struct rtpengine_target *t) {
 			free_crypto_context(&t->outputs[i].encrypt_rtp);
 			free_crypto_context(&t->outputs[i].encrypt_rtcp);
 			dst_release(t->outputs[i].dst);
-			put_net(t->outputs[i].net);
+			// A target may be deleted while some output slots are still
+			// uninitialised (or failed during setup). put_net(NULL) can
+			// dereference NULL; only release a reference we acquired.
+			if (t->outputs[i].net)
+				put_net(t->outputs[i].net);
 		}
 		kfree(t->outputs);
 	}
@@ -7161,7 +7165,7 @@ static int rtpengine46(struct sk_buff *oskb,
 			g->decrypt_rtp.cipher->name);
 
 	datalen = ntohs(uh->len);
-	if (datalen < sizeof(*uh))
+	if (datalen < sizeof(*uh) || datalen > oskb->len - (oskb->transport_header - oskb->network_header))
 		goto out_target;
 	datalen -= sizeof(*uh);
 	DBG("udp payload = %u\n", datalen);

@@ -44,6 +44,7 @@ TYPED_GQUEUE(tags, struct ng_tag)
 	X(codec_accept) \
 	X(codec_consume) \
 	X(sdes_order)		/* the order, in which crypto suites are being added to the SDP */ \
+	X(sdes_keys)		/* "SUITE:base64" master key and salt to use for our side, per suite */ \
 	X(sdes_offerer_pref)	/* preferred crypto suites to be selected for the offerer */
 
 #define RTPE_NG_FLAGS_SDP_ATTR_Q_PARAMS \
@@ -160,6 +161,8 @@ struct sdp_ng_flags {
 	enum block_dtmf_mode block_dtmf_mode;
 	int delay_buffer;
 	GArray *frequencies;
+	GArray *local_ports;		/* local RTP port per media section, towards the recipient */
+	GArray *from_local_ports;	/* local RTP port per media section, towards the sender */
 	int volume;
 	char digit;
 	str trigger;
@@ -276,6 +279,7 @@ RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
 		     detect_dtmf:1,
 		     block_dtmf:1,
 		     block_egress:1,
+		     stop_on_ingress:1,
 	             t38_decode:1,
 	             t38_force:1,
 	             t38_stop:1,
